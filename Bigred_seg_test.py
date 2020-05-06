@@ -1,48 +1,43 @@
-from __future__ import print_function
-import argparse
-import os
-import sys
-sys.path.append('../')
-sys.path.append('/')
 
-import random
+from __future__ import print_function
+import os
+import argparse
 import torch
-import torch.nn.parallel
-import torch.optim as optim
-import torch.utils.data
-import dataset as dt
-from model import PointNetDenseCls, feature_transform_regularizer
+import torch.nn as nn
 import torch.nn.functional as F
-from tqdm import tqdm
+import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR
+from data import S3DIS
+from model import DGCNN_semseg
 import numpy as np
+from torch.utils.data import DataLoader
+from util import cal_loss, IOStream
+import sklearn.metrics as metrics
 import pdb
 from torch.utils.tensorboard import SummaryWriter
-from glob import glob
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
-from itertools import count
-import pandas as pd
-from metrics import AverageMeter
-from collections import OrderedDict
+import BigredDataSet as dt
+from tqdm import tqdm
 import time
-parser = argparse.ArgumentParser()
-parser.add_argument(
-    '--batchSize', type=int, default=1, help='input batch size')
-parser.add_argument(
-    '--workers', type=int, help='number of data loading workers', default=32)
-parser.add_argument(
-    '--nepoch', type=int, default=1, help='number of epochs to train for')
-parser.add_argument('--outf', type=str, default='seg', help='output folder')
-parser.add_argument('--model', type=str, default='', help='model path')
-parser.add_argument('--dataset', type=str, default='../../bigRed_h5_pointnet', help="dataset path")
-parser.add_argument('--class_choice', type=str, default='Pedestrain', help="class_choice")
-parser.add_argument('--feature_transform', default=True, help="use feature transform")
-parser.add_argument('--load_model_dir', type=str, default='Sun Apr 26 07:16:44 2020/', help="retest")
+from collections import OrderedDict
+from metrics import AverageMeter
 
+# torch.backends.cudnn.deterministic = True
+# torch.backends.cudnn.benchmark = True
+# os.environ["CUDA_VISIBLE_DEVICES"] ='0,1'
 
-#pdb.set_trace()
+def _init_():
+    if not os.path.exists('checkpoints'):
+        os.makedirs('checkpoints')
+    if not os.path.exists('checkpoints/'+args.exp_name):
+        os.makedirs('checkpoints/'+args.exp_name)
+    if not os.path.exists('checkpoints/'+args.exp_name+'/'+'models'):
+        os.makedirs('checkpoints/'+args.exp_name+'/'+'models')
+    os.system('cp main_semseg.py checkpoints'+'/'+args.exp_name+'/'+'main_semseg.py.backup')
+    os.system('cp model.py checkpoints' + '/' + args.exp_name + '/' + 'model.py.backup')
+    os.system('cp util.py checkpoints' + '/' + args.exp_name + '/' + 'util.py.backup')
+    os.system('cp data.py checkpoints' + '/' + args.exp_name + '/' + 'data.py.backup')
 
-
+#m_iou = mIoU_one_frame(seg_pred, seg)
 def convert_state_dict(state_dict):
 
     if not next(iter(state_dict)).startswith("module."):
@@ -54,148 +49,232 @@ def convert_state_dict(state_dict):
         new_state_dict[name] = v
     return new_state_dict
 
-def mIoU(y_pred, y):
+def mIoU_one_frame(seg_pred, seg):
+
+    seg_pred_new = seg_pred.transpose(1,2)
+    pred = seg_pred.view(-1, 2)
+    pred_choice = pred.data.max(1)[1]
+    y_pred = pred_choice.cpu().data.numpy()
+
+    y = seg.view(-1,).cpu().detach().numpy()
+
+    #pdb.set_trace()
     ioU = []
-    class_num = [0, 1]
+    class_num = [0,1]
     for num in class_num:
         I = np.sum(np.logical_and(y_pred == num, y == num))
         U = np.sum(np.logical_or(y_pred == num, y == num))
         ioU.append(I / float(U))
     ave = np.mean(ioU)
-    return (ave)
+    return(ave)
 
 
+def calculate_sem_IoU(pred_np, seg_np):
+    I_all = np.zeros(2)
+    U_all = np.zeros(2)
+    for sem_idx in range(seg_np.shape[0]):
+        for sem in range(2):
+            I = np.sum(np.logical_and(pred_np[sem_idx] == sem, seg_np[sem_idx] == sem))
+            U = np.sum(np.logical_or(pred_np[sem_idx] == sem, seg_np[sem_idx] == sem))
+            I_all[sem] += I
+            U_all[sem] += U
+    return I_all / U_all
 
-opt = parser.parse_args()
-# print(opt)
 
-PATH = opt.load_model_dir+'/best_model.pth'
-my_loader = torch.load(PATH)
-para_state_dict = my_loader['state_dict']
-opt.num_channel = my_loader['num_channel']
+def test(args, io):
+    load_dir = input('Enter the best model_dir: ')
+    device = torch.device("cuda" if args.cuda else "cpu")
+    temp_package = torch_load(load_dir)
+    args.num_channel = temp_package['num_channel']
+    model = DGCNN_semseg(args,num_channel = args.num_channel).to(device)
 
-if(opt.num_channel>3):
-    opt.feature_transform = True
-else:
-    opt.feature_transform = False
+    temp_dict = temp_package['state_dict']
+    temp_dict = convert_state_dict(temp_dict)
+    model.load_state_dict(temp_dict)
 
-#pdb.set_trace()
 
-print('----------------------Creating Model----------------------')
-classifier = PointNetDenseCls(k=2, feature_transform=opt.feature_transform, num_channel=opt.num_channel)
-# classifier = torch.nn.DataParallel(classifier, device_ids=[0, 1])
-print("Loading: ", PATH)
-
-# current_epoch = int(PATH[-5])
-# print("current_epoch:", current_epoch)
-new_state_dict = convert_state_dict(para_state_dict)
-classifier.load_state_dict(new_state_dict)  # Choose whatever GPU device number you want
-classifier.cuda()
-
-num_classes = 2
-opt.manualSeed = random.randint(1, 10000)  # fix seed
-print("Random Seed: ", opt.manualSeed)
-random.seed(opt.manualSeed)
-torch.manual_seed(opt.manualSeed)
-
-test_dataset = dt.BigredDataSet(
-    root=opt.dataset,
+    num_classes =2
+    test_dataset = dt.BigredDataSet(
+    root=args.datadir,
     is_train=False,
     is_validation=False,
     is_test=True,
-    num_channel = opt.num_channel
-)
-testloader = torch.utils.data.DataLoader(
-    test_dataset,
-    batch_size=opt.batchSize,
-    shuffle=False,
-    pin_memory=True,
-    drop_last=True,
-    num_workers=int(opt.workers))
-print("len(testdataloader):", len(testloader))
+    num_channel = args.num_channel,
+    test_code = False
+    )   
+    file_dict = test_dataset.file_dict
+    sorted_keys = np.array(sorted(file_dict.keys()))
 
-num_batch = len(testloader) / opt.batchSize
+    result_sheet = {
+    'Complex':[[],[]],
+    'Medium':[[],[]],
+    'Simple':[[],[]],
+    'multiPeople':[[],[]]
+    'singlePerson':[[],[]]
+    }
 
-mean_miou = AverageMeter()
-mean_acc = AverageMeter()
-mean_time = AverageMeter()
+    for key in sorted_keys:
+        tempname = file_dict[key]
+        result_sheet[tempname] = [[],[]]
 
-num_classes = 2
-try:
-    os.makedirs(opt.outf)
-except OSError:
-    pass
+        # tempname = tempname[:-3]
+        # difficulty,location,isSingle = tempname.split("_")
 
-blue = lambda x: '\033[94m' + x + '\033[0m'
 
-print("----------------------Test----------------------")
-with torch.no_grad():
-    mean_miou.reset()
-    mean_acc.reset()
-    for j, data in tqdm(enumerate(testloader), total=len(testloader), smoothing=0.9):
-        points, target = data
-        points = points.transpose(2, 1)
-        points, target = points.cuda(), target.cuda()
-        classifier = classifier.eval()
-        tic = time.perf_counter()
-        pred, _ = classifier(points)
-        toc = time.perf_counter()
-        #print(f"Downloaded the tutorial in {toc - tic:0.4f} seconds")
-        pred = pred.view(-1, num_classes)
-        target = target.view(-1, 1)[:, 0]
-        loss = F.nll_loss(pred, target)
-        pred_choice = pred.data.max(1)[1]
-        correct = pred_choice.eq(target.data).cpu().sum()
-        pred_np = pred_choice.cpu().data.numpy()
-        target_np = target.cpu().data.numpy()
-        m_iou = mIoU(pred_np, target_np)
-        mean_miou.update(m_iou)
-        mean_acc.update(correct.item()/float(opt.batchSize * 20000))
-        mean_time.update(toc - tic)
+    test_dataloader = DataLoader(test_dataset, 
+    num_workers=32, batch_size=args.batch_size, shuffle=False, drop_last=True)
+
+    print("Let's use", torch.cuda.device_count(), "GPUs!")
+
+
+    best_test_iou = 0
+    ####################
+    # Test
+    ####################
+    test_loss = 0.0
+    count = 0.0
+    model.eval()
+    test_true_cls = []
+    test_pred_cls = []
+    test_true_seg = []
+    test_pred_seg = []
+
+
+    mean_time = AverageMeter()
+
+
+    result_sheet
+    with torch.no_grad():
+        for j, data1 in tqdm(enumerate(test_dataloader), total=len(test_dataloader), smoothing=0.9):
+            temp_arr = sorted_keys<=j
+            index_for_keys = sum(temp_arr)
+            file_name = sorted_keys[index_for_keys]
+
+            tempname = tempname[:-3]
+            difficulty,location,isSingle = tempname.split("_")
+
+
+
+            data, seg = data1
+            data, seg = data.to(device), seg.to(device)
+            data = data.permute(0, 2, 1)
+            batch_size = data.size()[0]
+
+            tic = time.perf_counter()
+            seg_pred = model(data)
+            toc = time.perf_counter()
+
+            seg_pred = seg_pred.permute(0, 2, 1).contiguous()
+            pred = seg_pred.max(dim=2)[1]
+            count += batch_size
+            seg_np = seg.cpu().numpy()
+            pred_np = pred.detach().cpu().numpy()
+            #0test_pred_seg
+            #1test_true_seg
+            result_sheet[file_name][0].append(seg_np)
+            result_sheet[difficulty][0].append(seg_np)
+            result_sheet[isSingle][0].append(seg_np)
+
+            result_sheet[file_name][1].append(pred_np)
+            result_sheet[difficulty][1].append(pred_np)
+            result_sheet[isSingle][1].append(pred_np)
+
+
+            test_true_cls.append(seg_np.reshape(-1))
+            test_pred_cls.append(pred_np.reshape(-1))
+            test_true_seg.append(seg_np)
+            test_pred_seg.append(pred_np)
+            mean_time.update(toc - tic)
+
     test_time = mean_time.avg
-    val_ave_miou = mean_miou.avg
-    val_ave_acc = mean_acc.avg
-    print('val_miou: %f' % my_loader['Validation_ave_miou'])
-    print('Test_miou: %f' % val_ave_miou)
-    print('Test_acc: %f' % val_ave_acc)
+    test_true_cls = np.concatenate(test_true_cls)
+    test_pred_cls = np.concatenate(test_pred_cls)
+    test_acc = metrics.accuracy_score(test_true_cls, test_pred_cls)
+    avg_per_class_acc = metrics.balanced_accuracy_score(test_true_cls, test_pred_cls)
+
+    test_true_seg = np.concatenate(test_true_seg, axis=0)
+    test_pred_seg = np.concatenate(test_pred_seg, axis=0)
+    test_ious = calculate_sem_IoU(test_pred_seg, test_true_seg)
+
+
+    print('val_miou: %f' % temp_package['Validation_ave_miou'])
+    print('Test_miou: %f' % test_ious)
+    print('Test_acc: %f' % test_acc)
     print('Test ave time(sec/frame): %f' % (test_time))
-    print('Test ave time(frame/sec): %f' % (1/test_time))
+    print('Test ave time(frame/sec): %f' % (1 / test_time))
 
-        # package = dict()
-        # package['state_dict'] = classifier.state_dict()
-        # package['val_ave_miou'] = val_ave_miou
-        # package['val_ave_acc'] = val_ave_acc
-        # package['current_epoch'] = current_epoch
+    for k in result_sheet.keys():
+        test_pred_seg_temp, test_true_seg_temp = result_sheet[k]
+        test_ious_temp = calculate_sem_IoU(test_pred_seg_temp, test_trutest_true_seg_tempe_seg)
+        result_sheet[k] = test_ious_temp
 
-        # torch.save(classifier.state_dict(),'seg/xyz_intensity_label_Wed_Apr_22/validation/val_miou_%f_val_acc_%f_%d.pth' % (val_ave_miou,val_ave_acc,current_epoch))
-        # if(best_value<val_ave_miou):
-        #     best_value = val_ave_miou
-        #     torch.save(classifier.state_dict(),'seg/xyz_intensity_label_Wed_Apr_22/validation/best_model_val_miou_%f.pth'% val_ave_miou)
+    print(result_sheet)
+    pdb.set_trace()
 
-    ## benchmark mIOU
-    # shape_ious = []
-    # for i,data in tqdm(enumerate(testdataloader, 0)):
-    #     points, target = data
-    #     points = points.transpose(2, 1)
-    #     points, target = points.cuda(), target.cuda()
-    #     classifier = classifier.eval()
-    #     pred, _, _ = classifier(points)
-    #     pred_choice = pred.data.max(2)[1]
-    #
-    #     pred_np = pred_choice.cpu().data.numpy()
-    #     target_np = target.cpu().data.numpy() - 1
-    #
-    #     for shape_idx in range(target_np.shape[0]):
-    #         parts = range(num_classes)#np.unique(target_np[shape_idx])
-    #         part_ious = []
-    #         for part in parts:
-    #             I = np.sum(np.logical_and(pred_np[shape_idx] == part, target_np[shape_idx] == part))
-    #             U = np.sum(np.logical_or(pred_np[shape_idx] == part, target_np[shape_idx] == part))
-    #             if U == 0:
-    #                 iou = 1 #If the union of groundtruth and prediction points is empty, then count part IoU as 1
-    #             else:
-    #                 iou = I / float(U)
-    #             part_ious.append(iou)
-    #         shape_ious.append(np.mean(part_ious))
-    #
-    # print("mIOU for class {}: {}".format(opt.class_choice, np.mean(shape_ious)))
+
+
+
+
+if __name__ == "__main__":
+    # Training settings
+    parser = argparse.ArgumentParser(description='Point Cloud Part Segmentation')
+    parser.add_argument('--exp_name', type=str, default=str(time.ctime()), metavar='N',help='Name of the experiment')
+
+    parser.add_argument('--model', type=str, default='dgcnn', metavar='N',
+                        choices=['dgcnn'],
+                        help='Model to use, [dgcnn]')
+
+    parser.add_argument('--batch_size', type=int, default=1, metavar='batch_size',
+                        help='Size of batch)')
+    parser.add_argument('--epochs', type=int, default=100, metavar='N',
+                        help='number of episode to train ')
+    parser.add_argument('--use_sgd', type=bool, default=False,
+                        help='Use SGD')
+    parser.add_argument('--lr', type=float, default=0.001, metavar='LR',
+                        help='learning rate (default: 0.001, 0.1 if using sgd)')
+    parser.add_argument('--momentum', type=float, default=0.9, metavar='M',
+                        help='SGD momentum (default: 0.9)')
+    parser.add_argument('--scheduler', type=str, default='cos', metavar='N',
+                        choices=['cos', 'step'],
+                        help='Scheduler to use, [cos, step]')
+    parser.add_argument('--no_cuda', type=bool, default=False,
+                        help='enables CUDA training')
+    parser.add_argument('--seed', type=int, default=1, metavar='S',
+                        help='random seed (default: 1)')
+    parser.add_argument('--eval', type=bool,  default=False,
+                        help='evaluate the model')
+    parser.add_argument('--num_points', type=int, default=20000,
+                        help='num of points to use')
+    parser.add_argument('--dropout', type=float, default=0.5,
+                        help='dropout rate')
+    parser.add_argument('--emb_dims', type=int, default=1024, metavar='N',
+                        help='Dimension of embeddings')
+    parser.add_argument('--k', type=int, default=20, metavar='N',
+                        help='Num of nearest neighbors to use')
+    parser.add_argument('--model_root', type=str, default='', metavar='N',
+                        help='Pretrained model root')
+    parser.add_argument('--num_channel', type=int, default=4, metavar='N',
+                        help='num_channel')
+    parser.add_argument('--datadir', type=str, default='../bigRed_h5_pointnet', metavar='N',
+                        help='num_channel')
+
+    args = parser.parse_args()
+    _init_()
+    io = IOStream('checkpoints/' + args.exp_name + '/run.log')
+    io.cprint(str(args))
+
+
+
+    args.cuda = not args.no_cuda and torch.cuda.is_available()
+    torch.manual_seed(args.seed)
+    if args.cuda:
+        io.cprint(
+            'Using GPU : ' + str(torch.cuda.current_device()) + ' from ' + str(torch.cuda.device_count()) + ' devices')
+        torch.cuda.manual_seed(args.seed)
+    else:
+        io.cprint('Using CPU')
+
+    if not args.eval:
+        train(args, io)
+    else:
+        test(args, io)
