@@ -29,6 +29,7 @@ class BigredDataSet():
         self.is_test = is_test
         self.is_validation = is_validation
         self.test_code = test_code
+        self.file_dict = {}
         point_set = []
         label_set = []
         laserID_set = []
@@ -53,7 +54,7 @@ class BigredDataSet():
                     if(self.test_code == True):
                             train_tail = int(np.array(f['label']).shape[0] * 0.001)
                             validation_tail = int(np.array(f['label']).shape[0] * 0.0015)
-                            test_tail = int(np.array(f['label']).shape[0] * 1)
+                            test_tail = int(np.array(f['label']).shape[0] * 0.0020)
                     current_point = []
                     current_lable = []
                     if (self.is_train == True and self.is_validation == False and self.is_test == False):
@@ -89,9 +90,12 @@ class BigredDataSet():
                             np.array(f['laserID'][validation_tail:test_tail, :]).reshape(n_frame, n_points, 1))
                         current_point.append(
                             np.array(f['intensity'][validation_tail:test_tail, :]).reshape(n_frame, n_points, 1))
+                        self.file_dict[counter_for_file] = file
                         current_point = np.concatenate(current_point, axis=2)
                         lableset.append(np.array(f['label'][validation_tail:test_tail, :]))
                         pointset.append(current_point)
+
+
                 except:
                     f.close()
 
